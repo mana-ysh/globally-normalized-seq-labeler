@@ -217,20 +217,6 @@ class GlobalNN(object):
             p.data = self.orig_weight[i]
         self.origw_flg = True
 
-    def simple_batch_update(self, batch_sent, batch_gold_poss):
-        assert len(batch_sent) == len(batch_gold_poss)
-        batchsize = len(batch_sent)
-        sum_loss = 0
-        n_steps = []
-        for i in range(batchsize):
-            loss, n_step = self.beam_search(batch_sent[i], batch_gold_poss[i], train_flg=True)
-            sum_loss += loss
-            n_steps.append(n_step)
-        self.local_model.zerograds()
-        sum_loss.backward()
-        self.opt.update()
-        return sum_loss.data, n_steps
-
     def visualize_lattice(self, out_path=None):
         n_step = max(i for i in range(len(self.beams)) if self.beams[i])
         dot = Digraph()
@@ -249,102 +235,6 @@ class GlobalNN(object):
         dot.render('lattice')
         del dot
 
-    def confirm_gradient(self, sent, gold_poss):
-        chainer_grads = []
-        loss, _ = self.update(sent, gold_poss)
-        for p in self.local_model.params():
-            chainer_grads.append(p.grad)
-
-        n_step = max(i for i in range(len(self.beams)) if self.beams[i])
-        # print('self.probs.shape[-1]: {}'.format(self.probs.shape[-1]))
-        exp_beam = 0
-        last_beam = self.beams[n_step]
-        # assert len(last_beam)+1 == self.probs.shape[-1] or n_step == len(self.beams)
-        if len(last_beam)+1 == self.probs.shape[-1]:
-            n_state = 9
-        elif n_step == len(self.beams):
-            n_step = 8
-        else:
-            raise
-        prev_actions = []
-
-        for l in self.local_model.links():
-            if l.name == 'h2y':
-                tar_link = l
-        print('phis: {}'.format(self.phis.data))
-        for i in range(n_state):
-            if i == 0 and n_state==9:  # gold
-                print('gold_action: {}'.format(self.gold_state.prev_action))
-                print('prob: {}'.format(self.probs[0][i]))
-                print('grad...')
-                print(tar_link.W.grad[self.gold_state.prev_action])
-                print('cosine similarity between phi and grad: {}'.format(cos_sim(self.phis.data[0], tar_link.W.grad[self.gold_state.prev_action])))
-            else:
-                s = last_beam[i-1]
-                print('prev_action: {}'.format(s.prev_action))
-                print('prob: {}'.format(self.probs[0][i]))
-                print('grad...')
-                print(tar_link.W.grad[s.prev_action])
-                print('cosine similarity between phi and grad: {}'.format(cos_sim(self.phis.data[0], tar_link.W.grad[s.prev_action])))
-        raise
-        for i in range(n_state-1):
-            print(len(last_beam))
-            s = last_beam[i]
-            print('s.prev_action: {}'.format(s.prev_action))
-            prev_actions.append(s.prev_action)
-            phis = 0
-            while s.leftptrs:
-                # phis += s.phi
-                phis += s.leftptrs.phi
-                s = s.leftptrs
-            exp_beam += self.probs[0][i] * phis
-
-        gold_phis = 0
-        cur_s = self.gold_state
-        print('gold_state.prev_action: {}'.format(cur_s.prev_action))
-        while cur_s.leftptrs:
-            gold_phis += cur_s.leftptrs.phi
-            cur_s = cur_s.leftptrs
-
-        outlayer_grad = - gold_phis + exp_beam
-        print(outlayer_grad)
-        print(outlayer_grad.shape)
-        print('probs: {}'.format(self.probs))
-        print('phis: {}'.format(self.phis.data))
-        for l in self.local_model.links():
-            if l.name == 'h2y':
-                print(l.W.shape)
-                # print(l.W.grad)
-                for idx in prev_actions:
-                    print('prev_action: {}'.format(idx))
-                    print(l.W.grad[idx])
-
-        raise
-
-
-
-        print('=====BEFORE UPDATE======')
-        ps = []
-        for p in self.local_model.params():
-            print('-----data-----')
-            print(p.data)
-            print('-----grad-----')
-            print(p.grad)
-            ps.append(copy.deepcopy(p))
-        loss, _ = self.update(sent, gold_poss)
-        print('=====AFTER UPDATE======')
-        for i, p in enumerate(self.local_model.params()):
-            print('-----data-----')
-            print(p.data)
-            print('-----grad-----')
-            print(p.grad)
-            print('-----diff-----')
-            print(p.data-ps[i].data)
-
-    def get_outlayer_grad(self):
-        n_step = max(i for i in range(len(self.beams)) if self.beams[i])
-        raise NotImplementedError
-
     def save(self, model_path):
         if self.gpu_id > -1:
             self.local_model.to_cpu()
@@ -360,74 +250,6 @@ class GlobalNN(object):
         with open(model_path, 'rb') as f:
             globalnn = dill.load(f)
         return globalnn
-
-    def test_beam_search(self, sent, gold_poss, train_flg):
-        n_word = len(sent)
-        n_step = n_word  # In POS tagging, we need (n_word) shift actions
-        self.beams = [None] * (n_step + 1)
-        self.beams[0] = [State.gen_initstate(sent, self.n_window_word, self.pos_order, self.pad_tokens, self.gpu_flg)]
-        # beam search
-        gold_rank = 0
-        prev_gold_state = self.beams[0][0]
-        for i in range(1, n_step+1):
-            print('===== {}th Beam ====='.format(i-1))
-            prev_beam = self.beams[i-1]
-            for s in prev_beam:
-                s.print_info()
-                print('')
-            buf = []
-            gold_item = None
-            gold_pos = gold_poss[i-1]
-            self.cache_local_score(self.beams[i-1])
-            state_score_vars = F.concat(tuple([s.score_var for s in self.beams[i-1]]))
-            s_a_mat_var = self.action_scores + F.transpose(F.tile(state_score_vars, (N_ACTION, 1)))
-            arg_idxs = self.argsort(s_a_mat_var.data, self.beam_width)
-            gold_beam_flg = False
-            self.beams[i] = []
-            for j, idx in enumerate(arg_idxs[:self.beam_width]):
-                state_id = int(idx//N_ACTION)
-                action_id = int(idx%N_ACTION)
-                cur_state = self.beams[i-1][state_id]
-                gold_act_flg = action_id == gold_pos
-                next_state_var = s_a_mat_var[state_id][action_id]
-                next_state = cur_state.take(action_id, next_state_var, gold_act_flg)
-                next_state.rank = j
-                # if next_state.gold_flg:
-                if state_id == gold_rank and gold_act_flg:
-                    gold_beam_flg = True
-                    gold_rank = j
-                    gold_item = next_state
-                self.beams[i].append(next_state)
-
-            if not gold_item:
-                gold_state_var = s_a_mat_var[gold_rank][gold_pos]
-                gold_item = prev_gold_state.take(gold_pos, gold_state_var, True)
-
-            if (not gold_beam_flg) and train_flg:
-                loss = self.cal_crf_loss(self.beams[i], gold_item, early_update_flg=True)
-                return loss, i
-
-            prev_gold_state = gold_item
-
-        if train_flg:
-            loss = self.cal_crf_loss(self.beams[i], gold_item, early_update_flg=False)
-            return loss, i
-        # in testing or decoding
-        else:
-            best_state = self.beams[-1][0]
-            pred_actions = best_state.all_actions()
-            return pred_actions
-
-    def test_update(self, sent, gold_poss):
-        loss, n_step = self.test_beam_search(sent, gold_poss, train_flg=True)
-        self.local_model.zerograds()
-        loss.backward()
-        self.opt.update()
-        for l in self.local_model.links():
-            if l.name == 'h2y':
-                tar_link = l
-        print(tar_link.W.grad)
-        return loss.data, n_step
 
 
 def np_topn_idxs(array, top_n):
